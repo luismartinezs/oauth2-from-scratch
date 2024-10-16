@@ -118,3 +118,139 @@ Run app server
   - best practices: encryption at rest, secure DB access, token rotation, token expiration, revocation mechanism, audit logging (log token issuance, refresh, revocation)
 - oAuth 2 secret / cryptographic keys: secure key management system: AWS KMS, Google Cloud KMS, Azure Key Vault, HashiCorp Vault..., limit access, rotate keys, backup keys securely
 - code challenge: secure DB, in-memory. Associate with auth code, treat it securely, delete or invalidate when auth code expires or is used
+
+# Auth flow (complete?)
+
+- User accesses `http://localhost:4000/`
+- User clicks on "Login with OAuth2": request to app server `/authorize` endpoint
+  - Client application generates a **code verifier** and **code challenge** for PKCE
+    - Uses `generateCodeVerifier()` and `generateCodeChallenge(codeVerifier)`
+  - Stores the **code verifier** in the user's session (`req.session.codeVerifier`)
+  - Generates a random **state** parameter for CSRF protection
+    - Stores the **state** in the user's session (`req.session.state`)
+  - Constructs the authorization URL with the following parameters:
+    - `response_type=code`
+    - `client_id=client123`
+    - `redirect_uri=http://localhost:4000/callback`
+    - `scope=read write`
+    - `state=<generated state>`
+    - `code_challenge=<generated code challenge>`
+    - `code_challenge_method=S256`
+  - Redirects the user's browser to the authorization server's `/authorize` endpoint with the constructed URL
+- User's browser navigates to `http://localhost:3000/authorize` with query parameters
+  - The URL includes parameters: `response_type`, `client_id`, `redirect_uri`, `scope`, `state`, `code_challenge`, `code_challenge_method`
+- Authorization server checks if the user is logged in (`requireLogin` middleware)
+  - Since the user is **not logged in**, the server redirects the user to the login page
+    - Redirects to `/login?redirect=<encoded original /authorize URL>`
+- User is presented with a login form at `http://localhost:3000/login`
+- User enters username and password and submits the form (`POST /login`)
+  - Enters `username=user` and `password=pass`
+- Authorization server's `/login` handler processes the login
+  - Authenticates the user by checking credentials against the in-memory `users` array
+  - On successful authentication:
+    - Sets `req.session.user` to the authenticated user
+    - Redirects the user back to the URL specified in the `redirect` parameter (original `/authorize` URL)
+- User is redirected back to `http://localhost:3000/authorize` with the original query parameters
+- Authorization server's `/authorize` endpoint processes the request
+  - Retrieves the client information based on `client_id`
+  - Validates the `redirect_uri` matches one of the client's registered URIs
+  - Displays an authorization page to the user asking to approve or deny access
+    - Shows:
+      - Application name (`Authorize client123`)
+      - Requested scopes (`Requested Scopes: read write`)
+      - Prompt: `Do you authorize the app to access your data?`
+    - Provides "Approve" and "Deny" buttons
+- User clicks on the "Approve" button (`POST /authorize` with `approve=yes`)
+- Authorization server's `/authorize` POST handler processes the approval
+  - Checks that `approve=yes`
+  - Generates an **authorization code** (e.g., using `uuidv4()`)
+  - Stores the authorization code along with associated data:
+    - `client_id`
+    - `user_id` (from `req.session.user`)
+    - `scope`
+    - `redirect_uri`
+    - `code_challenge`
+    - `code_challenge_method`
+    - Stores in `authorizationCodes[code]`
+  - Constructs a redirect URL to the client's `redirect_uri` (`http://localhost:4000/callback`) with query parameters:
+    - `code=<authorization code>`
+    - `state=<original state parameter>`
+  - Redirects the user's browser to the constructed URL
+- User's browser navigates to `http://localhost:4000/callback` with `code` and `state` query parameters
+- Client application's `/callback` endpoint processes the request
+  - Retrieves the `code` and `state` from query parameters
+  - Verifies that the `state` matches the one stored in the session (`req.session.state`)
+    - Protects against CSRF attacks
+  - Retrieves the `codeVerifier` from the session (`req.session.codeVerifier`)
+  - Constructs a POST request to the authorization server's `/token` endpoint to exchange the authorization code for an access token
+    - Includes the following parameters:
+      - `grant_type=authorization_code`
+      - `code=<authorization code received>`
+      - `redirect_uri=http://localhost:4000/callback`
+      - `code_verifier=<code verifier from session>`
+    - Adds an `Authorization` header with Basic authentication:
+      - Encodes `client_id` and `client_secret` using Base64
+  - Sends the POST request to `http://localhost:3000/token`
+- Authorization server's `/token` endpoint processes the token request
+  - Extracts `client_id` and `client_secret` from the `Authorization` header
+  - Validates client credentials against the registered clients
+  - Checks that only one authentication method is used (does not accept `client_id` in the body if already provided in the header)
+  - Processes the request based on `grant_type`
+    - Since `grant_type=authorization_code`, proceeds to handle authorization code grant
+  - Validates the authorization code provided (`code`)
+    - Checks if the code exists in `authorizationCodes` and matches the `client_id`
+  - Validates that the `redirect_uri` matches the one stored with the authorization code
+  - Validates the `code_verifier` against the stored `code_challenge` using the `code_challenge_method` (PKCE verification)
+    - If `code_challenge_method=S256`, computes the code challenge from the `code_verifier` and compares it
+  - Upon successful validation:
+    - Generates an **access token** (e.g., using `uuidv4()`)
+      - Sets an expiration time (e.g., 1 hour from now)
+      - Stores the token along with associated data (`user_id`, `scope`, `expiration`)
+    - Generates a **refresh token**
+      - Stores it with expiration time (e.g., 30 days)
+    - Deletes the used authorization code from `authorizationCodes`
+    - Returns a JSON response with:
+      - `access_token`
+      - `token_type` (e.g., `Bearer`)
+      - `expires_in` (e.g., `3600` seconds)
+      - `refresh_token`
+- Client application receives the token response from the authorization server
+  - Stores the token data (`access_token`, `refresh_token`, `expires_in`, `expiration_time`)
+  - Redirects the user to `/resource` to access the protected resource
+- User navigates to `http://localhost:4000/resource`
+- Client application's `/resource` endpoint attempts to access the protected resource
+  - Checks if the stored access token is valid (not expired)
+    - Compares current time with `tokenData.expiration_time`
+  - If the access token is expired:
+    - Constructs a POST request to the authorization server's `/token` endpoint to refresh the access token
+      - Includes the following parameters:
+        - `grant_type=refresh_token`
+        - `refresh_token=<stored refresh token>`
+      - Adds an `Authorization` header with Basic authentication:
+        - Encodes `client_id` and `client_secret` using Base64
+    - Sends the POST request to `http://localhost:3000/token`
+    - Authorization server processes the refresh token grant:
+      - Validates client credentials
+      - Validates the refresh token
+        - Checks if the refresh token exists and matches the `client_id`
+        - Checks if the refresh token has expired
+      - Generates a new access token and refresh token
+      - Deletes the old refresh token (token rotation)
+      - Returns a JSON response with the new tokens
+    - Client application updates the stored token data with the new access token and refresh token
+  - Constructs a GET request to the resource server's protected endpoint (`http://localhost:3000/resource`)
+    - Adds an `Authorization` header with the Bearer token:
+      - `Authorization: Bearer <access token>`
+  - Sends the GET request to the resource server
+- Resource server's `/resource` endpoint processes the request
+  - Extracts the access token from the `Authorization` header
+  - Validates the access token:
+    - Checks if the token exists in `accessTokens` and has not expired
+  - Checks if the token has the required scope (`read`)
+    - If the token's scope does not include `read`, returns a `403 Forbidden` error
+  - Retrieves the user data associated with the token
+  - Returns the protected resource data in a JSON response
+    - Example: `{ data: "Protected data for user" }`
+- Client application receives the response from the resource server
+  - Displays the protected resource data to the user
+    - Renders a page with the resource data (e.g., `<pre>{ data: "Protected data for user" }</pre>`)
