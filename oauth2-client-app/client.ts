@@ -2,11 +2,37 @@ import express, { Request, Response } from 'express';
 import bodyParser from 'body-parser';
 import { v4 as uuidv4 } from 'uuid';
 import session from 'express-session';
+import crypto from 'crypto';
+
+// PKCE (Proof Key for Code Exchange)
+// Function to generate a random code verifier
+function generateCodeVerifier(): string {
+  return base64URLEncode(crypto.randomBytes(32));
+}
+
+// Function to generate a code challenge from the code verifier
+function generateCodeChallenge(codeVerifier: string): string {
+  return base64URLEncode(sha256(codeVerifier));
+}
+
+// Helper functions
+function sha256(buffer: string): Buffer {
+  return crypto.createHash('sha256').update(buffer).digest();
+}
+
+function base64URLEncode(buffer: Buffer | string): string {
+  return Buffer.from(buffer)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
 
 const app = express();
 const port = 4000;
 
 const config = {
+  // should be stored in a secure location, not hardcoded in client
   client_id: 'client123',
   client_secret: 'secret456',
   authorization_endpoint: 'http://localhost:3000/authorize',
@@ -43,6 +69,11 @@ app.get('/', (req: Request, res: Response) => {
 
 // Redirect the user to the authorization server
 app.get('/authorize', (req: Request, res: Response) => {
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = generateCodeChallenge(codeVerifier);
+
+  req.session.codeVerifier = codeVerifier;
+
   const authorizationUrl = new URL(config.authorization_endpoint);
   authorizationUrl.searchParams.set('response_type', 'code');
   authorizationUrl.searchParams.set('client_id', config.client_id);
@@ -52,6 +83,9 @@ app.get('/authorize', (req: Request, res: Response) => {
   const state = uuidv4();
   req.session.state = state;
   authorizationUrl.searchParams.set('state', state);
+
+  authorizationUrl.searchParams.set('code_challenge', codeChallenge);
+  authorizationUrl.searchParams.set('code_challenge_method', 'S256');
 
   res.redirect(authorizationUrl.toString());
 });
@@ -69,22 +103,35 @@ app.get('/callback', async (req: Request, res: Response) => {
 
   req.session.state = null;
 
+  const codeVerifier = req.session.codeVerifier;
+  req.session.codeVerifier = null;
+  if (!codeVerifier) {
+    return res.status(400).send('Code verifier not found in session');
+  }
+
+  const basicAuth = Buffer.from(`${config.client_id}:${config.client_secret}`).toString('base64')
+
   // Exchange the authorization code for an access token
   try {
     const response = await fetch(config.token_endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${basicAuth}`
       },
       body: new URLSearchParams({
         grant_type: 'authorization_code',
         code: code as string,
         redirect_uri: config.redirect_uri,
-        client_id: config.client_id,
-        client_secret: config.client_secret,
+        code_verifier: codeVerifier
       }),
     });
     const data = await response.json();
+
+    if (data.error) {
+      return res.status(400).send(`Error exchanging code for token: ${data.error_description || data.error}`);
+    }
+
     tokenData = {
       access_token: data.access_token,
       refresh_token: data.refresh_token,
@@ -105,24 +152,32 @@ app.get('/resource', async (req: Request, res: Response) => {
     return res.redirect('/authorize');
   }
 
+  const basicAuth = Buffer.from(`${config.client_id}:${config.client_secret}`).toString('base64');
+
   if (tokenData.expiration_time < Date.now()) {
     try {
       const response = await fetch(config.token_endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
+          'Authorization': `Basic ${basicAuth}`,
         },
         body: new URLSearchParams({
           grant_type: 'refresh_token',
           refresh_token: tokenData.refresh_token,
-          client_id: config.client_id,
-          client_secret: config.client_secret,
         }),
       });
       const data = await response.json();
 
+      if (data.error) {
+        // Handle error (e.g., invalid refresh token)
+        tokenData = null;
+        return res.redirect('/authorize');
+      }
+
       // Update token data
       tokenData.access_token = data.access_token;
+      tokenData.refresh_token = data.refresh_token
       tokenData.expires_in = data.expires_in;
       tokenData.expiration_time = Date.now() + data.expires_in * 1000;
     } catch (error) {
